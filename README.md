@@ -205,13 +205,6 @@ Example: `msh/US/2/e/LongFast/!aabbccdd`
 The `/e/` indicates encrypted (default key). Packets are protobuf-encoded
 `ServiceEnvelope` messages.
 
-## MeshCore
-
-MeshCore is a separate protocol — no MQTT gateway in its firmware. For
-MeshCore capture, you'd need a second radio running MeshCore firmware
-with serial output to a companion host. The BQ schema has a
-`source_protocol` field ready for it, and `meshnarc_sub.py` has a stub
-for MeshCore packet ingestion, but the capture path is different hardware.
 
 ## Cost
 
