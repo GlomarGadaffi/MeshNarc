@@ -30,8 +30,8 @@ Passive Meshtastic packet capture to BigQuery via cellular MQTT gateway.
     ┌────────────────────────┐
     │  meshnarc-subscriber   │
     │  (Python, runs on      │
-    │   glolab / Cloud Run   │
-    │   Job / anywhere)      │
+    │   glolab / GCP e2-micro│
+    │   instance / anywhere) │
     │                        │
     │  • MQTT subscribe      │
     │  • Protobuf decode     │
@@ -182,6 +182,29 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now meshnarc
 ```
 
+#### Deploying to GCP (Buildpacks + e2-micro)
+
+If deploying to Google Cloud, meshnarc-subscriber runs best as a stateless daemon on an `e2-micro` Compute Engine instance using Container-Optimized OS.
+
+You can automatically build and deploy it using Buildpacks:
+
+```powershell
+# Using PowerShell
+./deploy_gcp.ps1 -Project your-gcp-project
+
+# Or using Bash
+./deploy_gcp.sh your-gcp-project
+```
+
+Then configure the running container with your MQTT credentials:
+
+```bash
+gcloud compute instances update-container meshnarc-sub \
+  --zone us-central1-a \
+  --project your-gcp-project \
+  --container-env="MESHNARC_BROKER=your-broker,MESHNARC_MQTT_USER=user,MESHNARC_MQTT_PASS=pass"
+```
+
 ### 6. Verify
 
 ```bash
@@ -205,6 +228,13 @@ Example: `msh/US/2/e/LongFast/!aabbccdd`
 The `/e/` indicates encrypted (default key). Packets are protobuf-encoded
 `ServiceEnvelope` messages.
 
+## MeshCore
+
+MeshCore is a separate protocol — no MQTT gateway in its firmware. For
+MeshCore capture, you'd need a second radio running MeshCore firmware
+with serial output to a companion host. The BQ schema has a
+`source_protocol` field ready for it, and `meshnarc_sub.py` has a stub
+for MeshCore packet ingestion, but the capture path is different hardware.
 
 ## Cost
 
