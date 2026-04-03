@@ -1,185 +1,223 @@
 # meshnarc
 
-Passive Meshtastic packet capture to BigQuery. Drop a LilyGo with a Hologram SIM somewhere with power, walk away, query the mesh from BQ.
-
-## Why this works
-
-Meshtastic firmware already has MQTT gateway mode. The T-SIM7080G-S3 already has a Cat-M1/NB-IoT modem. Hologram already sells the SIM. You don't write custom firmware or AT commands — you configure what's already there and put a subscriber on the other end that decodes protobuf and streams to BQ.
-
-The node is set to `CLIENT_MUTE`: receives everything, rebroadcasts nothing. Ghost mode. It decrypts traffic using the well-known default channel key (`AQ==`, which is just `0x01` expanded to AES-256), then ships plaintext protobuf over cellular MQTT. Any channel with a PSK you don't have stays opaque — you see the envelope but not the payload.
+Passive Meshtastic packet capture to BigQuery via cellular MQTT gateway.
 
 ## Architecture
 
 ```
-LilyGo T-SIM7080G-S3             subscriber host
-┌──────────────────────┐          ┌─────────────────────┐
-│ SX1262 LoRa (capture)│          │ meshnarc_sub.py     │
-│ ESP32-S3 (Meshtastic │          │ MQTT subscribe      │
-│   MQTT gateway mode) │          │ protobuf decode     │
-│ SIM7080G ─── Hologram├─────────▶│ AES-256-CTR decrypt │
-│              cellular │  MQTT   │ BQ streaming insert │
-└──────────────────────┘          └────────┬────────────┘
-                                           │
-                                           ▼
-                                       BigQuery
-                                    meshnarc.packets
+┌─────────────────────────────────┐
+│  LilyGo T-SIM7080G-S3          │
+│  ┌───────────┐  ┌────────────┐ │
+│  │ SX1262    │  │ SIM7080G   │ │
+│  │ LoRa      │  │ Cat-M1/    │ │
+│  │ (capture) │  │ NB-IoT     │ │
+│  └─────┬─────┘  └──────┬─────┘ │
+│        │  ESP32-S3      │       │
+│        │  Meshtastic    │       │
+│        │  MQTT Gateway  │       │
+│        └───────┬────────┘       │
+└────────────────┼────────────────┘
+                 │ Hologram IoT
+                 │ cellular
+                 ▼
+         ┌───────────────┐
+         │  MQTT Broker  │
+         │  (mosquitto   │
+         │   or HiveMQ)  │
+         └───────┬───────┘
+                 │
+                 ▼
+    ┌────────────────────────┐
+    │  meshnarc-subscriber   │
+    │  (Python, runs on      │
+    │   glolab / Cloud Run   │
+    │   Job / anywhere)      │
+    │                        │
+    │  • MQTT subscribe      │
+    │  • Protobuf decode     │
+    │  • BQ streaming insert │
+    └────────────┬───────────┘
+                 │
+                 ▼
+         ┌───────────────┐
+         │   BigQuery    │
+         │  meshnarc.    │
+         │  packets      │
+         └───────────────┘
 ```
 
-No serial cable. No companion Pi tethered to the radio. The subscriber runs anywhere that can reach the MQTT broker and BigQuery.
+## Components
 
-## What's in here
-
-```
-meshnarc_sub.py      MQTT subscriber → protobuf decode → BQ insert
-configure_node.sh    Meshtastic CLI commands to set up the LilyGo
-bq_schema.sql        Table + views (recent_nodes, messages, positions)
-meshnarc.service     systemd unit for the subscriber
-deploy.sh            Install deps, copy files, apply BQ schema
-requirements.txt     Python deps (5 packages, all platform SDKs)
-```
+1. **LilyGo T-SIM7080G-S3** — Meshtastic firmware, MQTT gateway mode
+2. **Hologram IoT SIM** — Cat-M1/NB-IoT cellular backhaul
+3. **MQTT Broker** — mosquitto (self-hosted) or HiveMQ Cloud (free tier)
+4. **meshnarc-subscriber** — Python daemon, decodes + inserts to BQ
+5. **BigQuery** — `meshnarc.packets` table
 
 ## Setup
 
-### 1. Flash the LilyGo
+### 1. Flash Meshtastic Firmware
 
-Meshtastic web flasher: https://flasher.meshtastic.org — board is `LilyGo T-SIM7080G-S3`, latest stable firmware. Nothing custom.
+Use the Meshtastic web flasher: https://flasher.meshtastic.org
+
+- Board: **LilyGo T-SIM7080G-S3**
+- Firmware: latest stable
 
 ### 2. Hologram SIM
 
-Get one from https://hologram.io, activate it. APN is `hologram`. The SIM7080G handles Cat-M1/NB-IoT negotiation — Hologram's auto-APN usually works, but Meshtastic wants it set explicitly.
+- Get a Hologram IoT SIM: https://hologram.io
+- Activate SIM, note ICCID
+- Hologram uses auto-APN, but for SIM7080G you may need to set:
+  - APN: `hologram` (Meshtastic config → Network → APN)
 
-Cost: ~$0.40/month device fee + $0.60/MB. MQTT packets are 100-300 bytes. Even a loud mesh won't hit 1 MB/month. Budget $1-2/month.
+### 3. Configure Meshtastic Node
 
-### 3. Configure the node
-
-Plug in the LilyGo via USB and run:
+Via Meshtastic Python CLI, app, or web UI:
 
 ```bash
-./configure_node.sh <broker-host> <mqtt-user> <mqtt-pass> <latitude> <longitude>
+# Set node role to CLIENT_MUTE (receive-only, don't rebroadcast — stealth)
+meshtastic --set lora.role CLIENT_MUTE
+
+# Enable MQTT gateway — uplinks ALL received packets
+meshtastic --set mqtt.enabled true
+meshtastic --set mqtt.address "your-broker.example.com"
+meshtastic --set mqtt.username "meshnarc"
+meshtastic --set mqtt.password "your-password"
+
+# Uplink enabled on default channel (index 0)
+meshtastic --ch-set uplink_enabled true --ch-index 0
+
+# Encryption key for default channel (the well-known default = AQ==)
+# This lets you decode all traffic using the default key
+meshtastic --ch-set psk "AQ==" --ch-index 0
+
+# If you want to capture additional channels, add them:
+# meshtastic --ch-add "SomeChannel"
+# meshtastic --ch-set psk "base64key==" --ch-index 1
+# meshtastic --ch-set uplink_enabled true --ch-index 1
+
+# Set fixed position (your capture site)
+meshtastic --setlat 29.6516 --setlon -82.3248 --setalt 30
+
+# Power settings — keep alive
+meshtastic --set power.is_always_powered true
 ```
 
-This sets:
-- **Role**: `CLIENT_MUTE` — passive receive, no rebroadcast
-- **MQTT**: enabled, pointed at your broker, uplink on channel 0, downlink off
-- **APN**: `hologram`
-- **Position**: fixed to your capture site
-- **Identity**: owner "meshnarc", short "NARC"
+#### Critical Settings Explained
 
-To capture channels beyond the default LongFast:
+- **CLIENT_MUTE**: The node receives everything but never retransmits.
+  Your meshnarc is passive — it doesn't participate in the mesh routing.
+  No one sees it rebroadcasting. Ghost mode.
 
-```bash
-meshtastic --ch-add "SomeChannel"
-meshtastic --ch-set psk "base64key==" --ch-index 1
-meshtastic --ch-set uplink_enabled true --ch-index 1
-```
+- **mqtt.enabled + uplink_enabled**: Every packet the LoRa radio receives
+  gets published to the MQTT broker over the SIM7080G cellular link.
 
-You need the PSK. No PSK, no decrypt — you'll get the packet envelope but the payload stays opaque.
+- **Default PSK `AQ==`**: This is the well-known Meshtastic default key
+  (0x01). All nodes on "LongFast" use this. Your node decrypts with the
+  same key, then uplinks the plaintext to MQTT. Any channel with a
+  custom PSK that you don't have stays encrypted (you'll see the packet
+  envelope but not the payload).
 
-### 4. MQTT broker
+### 4. MQTT Broker
 
-You need a broker the LilyGo can reach over the internet. Two options:
+#### Option A: Self-hosted mosquitto (recommended)
 
-**Self-hosted mosquitto** — any box with a public IP or VPS:
+On glolab or any server:
 
 ```bash
-sudo apt install mosquitto
+sudo apt install mosquitto mosquitto-clients
+sudo systemctl enable mosquitto
+
+# /etc/mosquitto/conf.d/meshnarc.conf
 cat << 'EOF' | sudo tee /etc/mosquitto/conf.d/meshnarc.conf
 listener 1883
 allow_anonymous false
 password_file /etc/mosquitto/passwd
 EOF
+
 sudo mosquitto_passwd -c /etc/mosquitto/passwd meshnarc
-sudo systemctl enable --now mosquitto
+sudo systemctl restart mosquitto
 ```
 
-> **Note:** The ESP32 can't run overlay networks like Tailscale/WireGuard/ZeroTier. If your broker is only reachable via an overlay, the LilyGo can't reach it. You need either a public-facing broker or a port forward.
+If glolab is on Tailscale, the LilyGo can't reach it directly (no
+Tailscale on ESP32). Options:
+- Expose mosquitto on a public IP with TLS + auth
+- Use a cloud-hosted broker instead
 
-**HiveMQ Cloud** — free tier, zero ops, 100 connections, 10 GB/month. More than enough. https://www.hivemq.com/mqtt-cloud-broker/
+#### Option B: HiveMQ Cloud (free tier, zero ops)
 
-### 5. BigQuery
+- https://www.hivemq.com/mqtt-cloud-broker/
+- Free tier: 100 connections, 10 GB/month
+- Get broker URL, username, password
+- Set in Meshtastic MQTT config
 
-```bash
-bq mk --dataset meshnarc
-bq query --use_legacy_sql=false < bq_schema.sql
-```
-
-The schema includes three views:
-- `recent_nodes` — 24h activity summary per node (packet count, avg RSSI/SNR, last position)
-- `messages` — decoded text messages
-- `positions` — position history for mapping
-
-Table is partitioned by `rx_timestamp` date, clustered on `source_protocol`, `port_num`, `from_id`.
-
-### 6. Run the subscriber
+### 5. Deploy meshnarc-subscriber
 
 ```bash
+# On glolab or any host
+cd meshnarc
 pip install -r requirements.txt --break-system-packages
 
+# Set up service account for BigQuery
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
+export MESHNARC_PROJECT=your-gcp-project
 
+# Create BQ dataset + table
+bq mk --dataset meshnarc
+bq query --use_legacy_sql=false < bq_schema.sql
+
+# Run
 python meshnarc_sub.py \
-    --broker <broker-host> \
-    --username <mqtt-user> \
-    --password <mqtt-pass> \
-    --topic "msh/US/2/e/#" \
-    --project <gcp-project-id> \
-    --lat <latitude> --lon <longitude> \
-    -v
+  --broker your-broker.example.com \
+  --username meshnarc \
+  --password your-password \
+  --topic "msh/US/2/e/LongFast/#"
 ```
 
-The `#` wildcard subscribes to all channels and all gateway nodes. Narrow with `msh/US/2/e/LongFast/#` if you only want the default channel.
-
-For persistent operation:
+#### As a systemd service
 
 ```bash
 sudo cp meshnarc.service /etc/systemd/system/
-# edit the Environment= lines in the unit first
 sudo systemctl daemon-reload
 sudo systemctl enable --now meshnarc
 ```
 
-### 7. Verify
+### 6. Verify
 
 ```bash
-# Watch raw MQTT traffic
-mosquitto_sub -h <broker-host> -u <mqtt-user> -P <mqtt-pass> -t "msh/#" -v
+# Watch MQTT traffic
+mosquitto_sub -h your-broker -u meshnarc -P password -t "msh/#" -v
 
 # Check BQ
-bq query 'SELECT rx_timestamp, from_id, port_num, payload_json
-           FROM meshnarc.packets ORDER BY rx_timestamp DESC LIMIT 10'
+bq query 'SELECT * FROM meshnarc.packets ORDER BY rx_timestamp DESC LIMIT 10'
 ```
 
-## How decryption works
+## MQTT Topic Structure
 
-Meshtastic uses AES-256-CTR. The nonce is `packet_id (4 bytes LE) + from_node (4 bytes LE) + 8 zero bytes`. The default channel key `AQ==` is `0x01`, which the firmware expands to 32 bytes by repeating.
-
-The subscriber tries all known keys against each encrypted packet. Pass additional channel keys with `--extra-keys`:
-
-```bash
-python meshnarc_sub.py --extra-keys "1:base64ChannelKey==" "2:anotherKey=="
-```
-
-The index is the Meshtastic channel index. If no key works, the packet is logged as `decrypt_fail` in stats and dropped — you see it existed but not what it said.
-
-## MQTT topic structure
-
-Meshtastic publishes to:
+Meshtastic publishes to topics like:
 
 ```
 msh/{region}/{channel_id}/e/{channel_name}/{gateway_node_id}
 ```
 
-The `/e/` means encrypted (which is all traffic — even the "unencrypted" default channel uses AES with the well-known key). Payloads are protobuf `ServiceEnvelope` containing a `MeshPacket`.
+Example: `msh/US/2/e/LongFast/!aabbccdd`
+
+The `/e/` indicates encrypted (default key). Packets are protobuf-encoded
+`ServiceEnvelope` messages.
 
 ## MeshCore
 
-MeshCore is a different protocol on the same LoRa hardware. It has no MQTT gateway mode in firmware. Capturing MeshCore requires a second radio running MeshCore firmware with serial output to a companion host — back to the tethered-Pi architecture.
+MeshCore is a separate protocol — no MQTT gateway in its firmware. For
+MeshCore capture, you'd need a second radio running MeshCore firmware
+with serial output to a companion host. The BQ schema has a
+`source_protocol` field ready for it, and `meshnarc_sub.py` has a stub
+for MeshCore packet ingestion, but the capture path is different hardware.
 
-The BQ schema has `source_protocol` ready for it. The subscriber has the column. But the capture path is a different hardware problem. If you want both protocols, you need two radios.
+## Cost
 
-## What this doesn't do
-
-- **Active participation.** The node never transmits mesh packets. It's receive-only.
-- **Custom firmware.** Everything here uses stock Meshtastic firmware and configuration.
-- **Channel discovery.** You need the PSK for any channel beyond the default. There's no way to brute-force Meshtastic channel keys from RF alone — AES-256 is AES-256.
-- **Real-time alerting.** This is a capture-and-query system. For alerts, add a Cloud Function trigger on BQ streaming buffer or process the MQTT stream directly.
+- **Hologram**: ~$0.40/month device fee + $0.60/MB data.
+  MQTT packets are tiny (~100-300 bytes each). Even heavy mesh traffic
+  (1000 packets/day) is well under 1 MB/month. Budget ~$1-2/month.
+- **HiveMQ Cloud**: Free tier sufficient.
+- **BigQuery**: Streaming inserts ~$0.01/200MB. Negligible at this scale.
+  Storage: $0.02/GB/month. You'd need millions of packets to hit $1.
