@@ -1,5 +1,3 @@
-# MeshNarc
-Passive Meshtastic packet capture to BigQuery. LilyGo T-SIM7080G-S3 in CLIENT_MUTE mode uplinks all received mesh traffic over Hologram cellular MQTT; a Python subscriber decodes protobuf and streams to BQ. Drop it somewhere with power and forget about it.
 # meshnarc
 
 Passive Meshtastic packet capture to BigQuery. Drop a LilyGo with a Hologram SIM somewhere with power, walk away, query the mesh from BQ.
@@ -13,21 +11,21 @@ The node is set to `CLIENT_MUTE`: receives everything, rebroadcasts nothing. Gho
 ## Architecture
 
 ```
-LilyGo T-SIM7080G-S3          anywhere with internet
-┌──────────────────────┐       ┌─────────────────────┐
-│ SX1262 LoRa (capture)│       │ meshnarc_sub.py     │
-│ ESP32-S3 (Meshtastic │       │ MQTT subscribe      │
-│   MQTT gateway mode) │       │ protobuf decode     │
-│ SIM7080G ─── Hologram├──────▶│ AES-256-CTR decrypt │
-│              cellular │ MQTT │ BQ streaming insert │
-└──────────────────────┘       └────────┬────────────┘
-                                        │
-                                        ▼
-                                    BigQuery
-                                 meshnarc.packets
+LilyGo T-SIM7080G-S3             subscriber host
+┌──────────────────────┐          ┌─────────────────────┐
+│ SX1262 LoRa (capture)│          │ meshnarc_sub.py     │
+│ ESP32-S3 (Meshtastic │          │ MQTT subscribe      │
+│   MQTT gateway mode) │          │ protobuf decode     │
+│ SIM7080G ─── Hologram├─────────▶│ AES-256-CTR decrypt │
+│              cellular │  MQTT   │ BQ streaming insert │
+└──────────────────────┘          └────────┬────────────┘
+                                           │
+                                           ▼
+                                       BigQuery
+                                    meshnarc.packets
 ```
 
-No serial cable. No companion Pi tethered to the radio. The subscriber runs on glolab, a VM, wherever — it just needs to reach the MQTT broker and BQ.
+No serial cable. No companion Pi tethered to the radio. The subscriber runs anywhere that can reach the MQTT broker and BigQuery.
 
 ## What's in here
 
@@ -57,7 +55,7 @@ Cost: ~$0.40/month device fee + $0.60/MB. MQTT packets are 100-300 bytes. Even a
 Plug in the LilyGo via USB and run:
 
 ```bash
-./configure_node.sh your-broker.example.com mqttuser mqttpass 29.6516 -82.3248
+./configure_node.sh <broker-host> <mqtt-user> <mqtt-pass> <latitude> <longitude>
 ```
 
 This sets:
@@ -81,7 +79,7 @@ You need the PSK. No PSK, no decrypt — you'll get the packet envelope but the 
 
 You need a broker the LilyGo can reach over the internet. Two options:
 
-**Self-hosted mosquitto** — if you have a box with a public IP or a VPS:
+**Self-hosted mosquitto** — any box with a public IP or VPS:
 
 ```bash
 sudo apt install mosquitto
@@ -94,7 +92,7 @@ sudo mosquitto_passwd -c /etc/mosquitto/passwd meshnarc
 sudo systemctl enable --now mosquitto
 ```
 
-Note: glolab is on Tailscale. The ESP32 can't run Tailscale. If your broker is only reachable via Tailscale, the LilyGo can't reach it. You need either a public-facing broker or a port forward.
+> **Note:** The ESP32 can't run overlay networks like Tailscale/WireGuard/ZeroTier. If your broker is only reachable via an overlay, the LilyGo can't reach it. You need either a public-facing broker or a port forward.
 
 **HiveMQ Cloud** — free tier, zero ops, 100 connections, 10 GB/month. More than enough. https://www.hivemq.com/mqtt-cloud-broker/
 
@@ -120,12 +118,12 @@ pip install -r requirements.txt --break-system-packages
 export GOOGLE_APPLICATION_CREDENTIALS=/path/to/sa-key.json
 
 python meshnarc_sub.py \
-    --broker your-broker.example.com \
-    --username meshnarc \
-    --password changeme \
+    --broker <broker-host> \
+    --username <mqtt-user> \
+    --password <mqtt-pass> \
     --topic "msh/US/2/e/#" \
-    --project your-gcp-project \
-    --lat 29.6516 --lon -82.3248 \
+    --project <gcp-project-id> \
+    --lat <latitude> --lon <longitude> \
     -v
 ```
 
@@ -144,7 +142,7 @@ sudo systemctl enable --now meshnarc
 
 ```bash
 # Watch raw MQTT traffic
-mosquitto_sub -h your-broker -u meshnarc -P password -t "msh/#" -v
+mosquitto_sub -h <broker-host> -u <mqtt-user> -P <mqtt-pass> -t "msh/#" -v
 
 # Check BQ
 bq query 'SELECT rx_timestamp, from_id, port_num, payload_json
